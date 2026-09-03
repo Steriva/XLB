@@ -11,3 +11,4 @@ from xlb.operator.boundary_condition.bc_extrapolation_outflow import Extrapolati
 from xlb.operator.boundary_condition.bc_hybrid import HybridBC
 from xlb.operator.boundary_condition.bc_scalar_dirichlet import ScalarDirichletBC
 from xlb.operator.boundary_condition.bc_scalar_neumann import ScalarNeumannBC
+from xlb.operator.boundary_condition.bc_scalar_outflow import ScalarOutflowBC

@@ -44,6 +44,24 @@ class ScalarNeumannBC(BoundaryCondition):
 
     with ``n`` the outward wall normal, so that a positive *flux* heats the domain.
 
+    Warning
+    -------
+    **Do not use this condition on an outlet or any boundary the fluid crosses.** It is a
+    wall condition and assumes the fluid does not move through the boundary.
+
+    Bounce-back nulls the antisymmetric part of the closure relation, which imposes zero
+    **total** normal flux, advective plus diffusive. On a no-slip wall the advective part
+    is already zero, so this correctly gives an adiabatic wall. On an open boundary the
+    normal is the direction the fluid crosses, ``c[l] . u != 0`` on the missing link, and
+    the outgoing scalar is reflected straight back in. Relative to the equilibrium
+    ``g_eq[l] = w[l] * phi * (1 + c[l] . u / cs^2)`` the reflected population is wrong by
+
+        2 * w[l] * phi * (c[l] . u) / cs^2
+
+    per node per step, which acts as a source sitting on the outlet and drives the scalar
+    out of its physical range within a few thousand steps. Use
+    :class:`~xlb.operator.boundary_condition.ScalarOutflowBC` for open boundaries.
+
     Note
     ----
     The identity ``sum_missing 2 * w[l] / cs^2 = 1`` holds for flat, axis-aligned walls.
