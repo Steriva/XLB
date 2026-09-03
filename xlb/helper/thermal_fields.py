@@ -59,6 +59,15 @@ def create_thermal_fields(
     return grid, g_0, g_1, missing_mask, bc_mask
 
 
+def _resolve_cs2(cs2):
+    """Accept either a number or a velocity set for the ``cs2`` argument.
+
+    Passing the velocity set is the safer form, because it cannot disagree with the
+    stencil actually being used.
+    """
+    return float(getattr(cs2, "cs2", cs2))
+
+
 def omega_from_diffusivity(diffusivity, cs2=1.0 / 3.0):
     """Relaxation parameter of the scalar populations for a given lattice diffusivity.
 
@@ -70,13 +79,20 @@ def omega_from_diffusivity(diffusivity, cs2=1.0 / 3.0):
     Args:
         diffusivity: Scalar diffusivity in lattice units. For the heat equation this is
                      ``alpha * dt / dx^2`` with ``alpha = k / (rho * cp)``.
-        cs2: Lattice speed of sound squared. Defaults to 1/3, the value used by all XLB
-             velocity sets.
+        cs2: Lattice speed of sound squared, or the velocity set to take it from.
+             Defaults to 1/3, which is correct for D2Q5, D2Q9, D3Q19 and D3Q27 but
+             **not** for D3Q7, whose cs^2 is 1/4. Passing the velocity set itself is
+             the safest form and works for every stencil::
+
+                 omega = omega_from_diffusivity(alpha, cs2=velocity_set)
+
+             Getting this wrong is silent: using the 1/3 default on D3Q7 yields a
+             diffusivity 25% below the one requested.
 
     Returns:
         The relaxation parameter omega, which must lie in (0, 2) for stability.
     """
-    return 1.0 / (diffusivity / cs2 + 0.5)
+    return 1.0 / (diffusivity / _resolve_cs2(cs2) + 0.5)
 
 
 def diffusivity_from_omega(omega, cs2=1.0 / 3.0):
@@ -86,9 +102,10 @@ def diffusivity_from_omega(omega, cs2=1.0 / 3.0):
 
     Args:
         omega: Relaxation parameter of the scalar populations.
-        cs2: Lattice speed of sound squared. Defaults to 1/3.
+        cs2: Lattice speed of sound squared, or the velocity set to take it from.
+             Defaults to 1/3. See :func:`omega_from_diffusivity` for why D3Q7 differs.
 
     Returns:
         The scalar diffusivity in lattice units.
     """
-    return cs2 * (1.0 / omega - 0.5)
+    return _resolve_cs2(cs2) * (1.0 / omega - 0.5)
