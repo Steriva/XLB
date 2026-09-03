@@ -315,5 +315,145 @@ def test_scalar_stencil_may_differ_from_the_default_one():
     assert np.allclose(temperature, 1.0 - xi, atol=1e-3)
 
 
+def test_velocity_sets_report_the_speed_of_sound_of_their_stencil():
+    """cs^2 is a property of the stencil and must be derived from it, not assumed.
+
+    Every stencil XLB uses for Navier-Stokes has cs^2 = 1/3, and so does the D2Q5 scalar
+    stencil, but the minimal 3D scalar stencil D3Q7 has cs^2 = 1/4. Hard-coding 1/3 would
+    silently give the wrong diffusivity on D3Q7.
+    """
+    for velocity_set, expected_cs2 in [
+        (xlb.velocity_set.D2Q5, 1.0 / 3.0),
+        (xlb.velocity_set.D2Q9, 1.0 / 3.0),
+        (xlb.velocity_set.D3Q7, 1.0 / 4.0),
+        (xlb.velocity_set.D3Q19, 1.0 / 3.0),
+        (xlb.velocity_set.D3Q27, 1.0 / 3.0),
+    ]:
+        vel_set = velocity_set(precision_policy=xlb.PrecisionPolicy.FP64FP64, compute_backend=ComputeBackend.JAX)
+
+        # cs^2 follows from sum_i w_i c_ia c_ib = cs^2 delta_ab
+        c, w = np.array(vel_set._c), np.array(vel_set._w)
+        second_moment = np.einsum("i,ai,bi->ab", w, c, c)
+
+        assert np.isclose(w.sum(), 1.0)
+        assert np.allclose(second_moment, expected_cs2 * np.eye(vel_set.d))
+        assert float(vel_set.cs2) == expected_cs2
+        assert float(vel_set.inv_cs2) == 1.0 / expected_cs2
+
+
+def test_omega_diffusivity_roundtrip_accepts_a_velocity_set():
+    """Passing the velocity set is the safe way to get cs^2 right on any stencil."""
+    for velocity_set in [xlb.velocity_set.D2Q5, xlb.velocity_set.D3Q7, xlb.velocity_set.D3Q19]:
+        vel_set = velocity_set(precision_policy=xlb.PrecisionPolicy.FP64FP64, compute_backend=ComputeBackend.JAX)
+        for alpha in [0.01, 1.0 / 6.0, 0.5]:
+            omega = omega_from_diffusivity(alpha, cs2=vel_set)
+            assert np.isclose(diffusivity_from_omega(omega, cs2=vel_set), alpha)
+
+
+def test_d3q7_pure_diffusion_recovers_the_heat_kernel():
+    """D3Q7 must reproduce the analytical heat kernel, as D2Q5 does in 2D.
+
+    The blob spreads as ``sigma^2(t) = sigma_0^2 + 2 * alpha * t``, so measuring the
+    variance directly tests the omega-to-diffusivity mapping, which is what makes D3Q7
+    easy to get wrong: its cs^2 is 1/4 rather than the 1/3 of every other XLB stencil.
+    """
+    init_xlb_env(xlb.velocity_set.D3Q7)
+    nx, ny, nz = 100, 3, 3
+    grid = grid_factory((nx, ny, nz))
+
+    stepper = ThermalStepper(grid=grid, boundary_conditions=[])
+    assert stepper.velocity_set.q == 7
+
+    alpha = 1.0 / 60.0
+    # D3Q7 has cs^2 = 1/4, so the stencil's own value must be used here
+    omega = omega_from_diffusivity(alpha, cs2=stepper.velocity_set)
+    num_steps = 400
+
+    x = np.arange(nx)
+    sigma, x0 = 6.0, nx // 2
+    phi_init = np.exp(-0.5 * ((x - x0) / sigma) ** 2)[None, :, None, None] * np.ones((1, nx, ny, nz))
+
+    g_0, g_1, bc_mask, missing_mask = stepper.prepare_fields(phi_init=phi_init)
+    u, source = stepper.prepare_aux_fields()
+
+    g_0 = run_thermal(stepper, g_0, g_1, u, source, bc_mask, missing_mask, omega, num_steps)
+    temperature = temperature_of(g_0)[:, ny // 2, nz // 2]
+
+    # The variance must grow at exactly 2 * alpha per step. D3Q7 is a smaller stencil than
+    # D2Q5 and carries slightly more higher-order error, hence the 1% tolerance.
+    weights = temperature / temperature.sum()
+    mean = (weights * x).sum()
+    variance = (weights * (x - mean) ** 2).sum()
+    assert np.isclose(variance, sigma**2 + 2.0 * alpha * num_steps, rtol=0.01)
+
+    # The profile itself must stay Gaussian, and the scalar must be conserved exactly
+    sigma_t = np.sqrt(sigma**2 + 2.0 * alpha * num_steps)
+    expected = sigma / sigma_t * np.exp(-0.5 * ((x - x0) / sigma_t) ** 2)
+    assert np.allclose(temperature, expected, atol=5e-3 * expected.max())
+    assert np.isclose(temperature.sum(), phi_init[0, :, ny // 2, nz // 2].sum(), rtol=1e-9)
+
+
+def test_d3q7_diffusion_is_isotropic():
+    """A point source on D3Q7 must spread identically along x, y and z."""
+    init_xlb_env(xlb.velocity_set.D3Q7)
+    n = 31
+    grid = grid_factory((n, n, n))
+
+    stepper = ThermalStepper(grid=grid, boundary_conditions=[])
+    omega = omega_from_diffusivity(1.0 / 6.0, cs2=stepper.velocity_set)
+
+    phi_init = np.zeros((1, n, n, n))
+    phi_init[0, n // 2, n // 2, n // 2] = 1.0
+
+    g_0, g_1, bc_mask, missing_mask = stepper.prepare_fields(phi_init=phi_init)
+    u, source = stepper.prepare_aux_fields()
+
+    g_0 = run_thermal(stepper, g_0, g_1, u, source, bc_mask, missing_mask, omega, 120)
+    temperature = temperature_of(g_0)
+
+    axis = np.arange(n)
+    variances = []
+    for d in range(3):
+        profile = temperature.sum(axis=tuple(i for i in range(3) if i != d))
+        weights = profile / profile.sum()
+        mean = (weights * axis).sum()
+        variances.append((weights * (axis - mean) ** 2).sum())
+
+    assert np.allclose(variances, variances[0], rtol=1e-10)
+
+
+def test_d3q7_advects_a_blob_at_the_prescribed_velocity():
+    """With a uniform velocity the blob must translate at exactly u_x while diffusing."""
+    init_xlb_env(xlb.velocity_set.D3Q7)
+    nx, ny, nz = 120, 3, 3
+    grid = grid_factory((nx, ny, nz))
+
+    stepper = ThermalStepper(grid=grid, boundary_conditions=[])
+    alpha = 1.0 / 60.0
+    omega = omega_from_diffusivity(alpha, cs2=stepper.velocity_set)
+    u_x, num_steps = 0.05, 400
+
+    x = np.arange(nx)
+    sigma, x0 = 5.0, nx // 4
+    phi_init = np.exp(-0.5 * ((x - x0) / sigma) ** 2)[None, :, None, None] * np.ones((1, nx, ny, nz))
+
+    g_0, g_1, bc_mask, missing_mask = stepper.prepare_fields(phi_init=phi_init)
+    u, source = stepper.prepare_aux_fields()
+    u = u.at[0].set(u_x)
+
+    g_0 = run_thermal(stepper, g_0, g_1, u, source, bc_mask, missing_mask, omega, num_steps)
+    temperature = temperature_of(g_0)[:, ny // 2, nz // 2]
+
+    # Unwrap around the expected centre so the periodic tails are not folded across
+    expected_centre = x0 + u_x * num_steps
+    x_unwrapped = (x - expected_centre + nx / 2) % nx - nx / 2
+    weights = temperature / temperature.sum()
+    centroid = (weights * x_unwrapped).sum() + expected_centre
+    variance = (weights * (x_unwrapped - (weights * x_unwrapped).sum()) ** 2).sum()
+
+    assert np.isclose(centroid, expected_centre, atol=0.1)
+    assert np.isclose(variance, sigma**2 + 2.0 * alpha * num_steps, rtol=0.02)
+
+
 if __name__ == "__main__":
     pytest.main()
